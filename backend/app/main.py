@@ -8,9 +8,8 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-from .parser import parse_srd_url, parse_markdown
+from .parser import parse_srd_url, parse_markdown, extract_metadata
 from .scraper import scrape_service
 from .comparator import compare_srd_with_form
 
@@ -24,22 +23,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory job store — replace with Redis for production
 _jobs: dict = {}
 
-
-# ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-class AnalyzeRequest(BaseModel):
-    srd_url: Optional[str] = None
-    service_url: str
-
-
-# ---------------------------------------------------------------------------
-# Background task
-# ---------------------------------------------------------------------------
 
 async def _run_analysis(
     job_id: str,
@@ -68,29 +53,42 @@ async def _run_analysis(
         _jobs[job_id]["error"] = str(exc)
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+@app.post("/api/parse-srd")
+async def parse_srd_endpoint(
+    srd_url: Optional[str] = Form(None),
+    srd_file: Optional[UploadFile] = File(None),
+):
+    """Parse an SRD document and return the extracted fields + metadata immediately (no scraping)."""
+    if not srd_file and not srd_url:
+        raise HTTPException(status_code=400, detail="Provide srd_file or srd_url")
+
+    if srd_file:
+        raw = await srd_file.read()
+        content = raw.decode("utf-8", errors="replace")
+        fields = await parse_markdown(content)
+        metadata = extract_metadata(content)
+        source = srd_file.filename or "uploaded_file"
+    else:
+        fields = await parse_srd_url(srd_url)
+        metadata = {}
+        source = srd_url
+
+    return {
+        "source": source,
+        "field_count": len(fields),
+        "fields": [f.model_dump() for f in fields],
+        "metadata": metadata,
+    }
+
 
 @app.post("/api/analyze")
-async def analyze_url(background_tasks: BackgroundTasks, body: AnalyzeRequest):
-    """Start analysis with a Notion URL as SRD source."""
-    if not body.srd_url:
-        raise HTTPException(status_code=400, detail="srd_url is required")
-    job_id = str(uuid.uuid4())
-    _jobs[job_id] = {"status": "pending", "result": None, "error": None}
-    background_tasks.add_task(_run_analysis, job_id, body.srd_url, None, body.service_url)
-    return {"job_id": job_id}
-
-
-@app.post("/api/analyze/upload")
-async def analyze_upload(
+async def analyze(
     background_tasks: BackgroundTasks,
     service_url: str = Form(...),
     srd_url: Optional[str] = Form(None),
     srd_file: Optional[UploadFile] = File(None),
 ):
-    """Start analysis with an uploaded Markdown file as SRD source."""
+    """Start analysis. Accepts multipart/form-data with service_url + (srd_url or srd_file)."""
     if not srd_file and not srd_url:
         raise HTTPException(status_code=400, detail="Provide srd_file or srd_url")
 

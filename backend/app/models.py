@@ -28,6 +28,8 @@ class SRDField(BaseModel):
     validation_rules: List[str] = []
     options: List[str] = []
     notes: Optional[str] = None
+    section: Optional[str] = None
+    block: Optional[str] = None
 
 
 class FormField(BaseModel):
@@ -53,6 +55,7 @@ class ComparisonReport(BaseModel):
     job_id: str
     service_url: str
     srd_source: str
+    compliant: bool
     matching_fields: List[str]
     missing_from_form: List[SRDField]
     extra_in_form: List[FormField]

@@ -123,6 +123,9 @@ def compare_srd_with_form(
     total_srd = len(srd_fields)
     compliance_score = round(len(matching_names) / total_srd * 100, 1) if total_srd else 0.0
 
+    error_mismatches = [m for m in mismatches if m.severity == "error"]
+    compliant = len(missing_from_form) == 0 and len(error_mismatches) == 0
+
     summary = {
         "total_srd_fields": total_srd,
         "total_form_fields": len(form_fields),
@@ -137,6 +140,7 @@ def compare_srd_with_form(
         job_id=job_id,
         service_url=service_url,
         srd_source=srd_source,
+        compliant=compliant,
         matching_fields=matching_names,
         missing_from_form=missing_from_form,
         extra_in_form=extra_in_form,
