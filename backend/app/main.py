@@ -1,0 +1,131 @@
+from __future__ import annotations
+import uuid
+import os
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from .parser import parse_srd_url, parse_markdown
+from .scraper import scrape_service
+from .comparator import compare_srd_with_form
+
+app = FastAPI(title="SRD Compliance Bot", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory job store — replace with Redis for production
+_jobs: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+class AnalyzeRequest(BaseModel):
+    srd_url: Optional[str] = None
+    service_url: str
+
+
+# ---------------------------------------------------------------------------
+# Background task
+# ---------------------------------------------------------------------------
+
+async def _run_analysis(
+    job_id: str,
+    srd_url: Optional[str],
+    srd_content: Optional[str],
+    service_url: str,
+) -> None:
+    _jobs[job_id]["status"] = "running"
+    try:
+        if srd_url:
+            srd_fields = await parse_srd_url(srd_url)
+            srd_source = srd_url
+        elif srd_content:
+            srd_fields = await parse_markdown(srd_content)
+            srd_source = "uploaded_file"
+        else:
+            raise ValueError("Provide srd_url or upload a markdown file")
+
+        form_fields = await scrape_service(service_url)
+        report = compare_srd_with_form(job_id, service_url, srd_source, srd_fields, form_fields)
+
+        _jobs[job_id]["status"] = "complete"
+        _jobs[job_id]["result"] = report.model_dump()
+    except Exception as exc:
+        _jobs[job_id]["status"] = "error"
+        _jobs[job_id]["error"] = str(exc)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/analyze")
+async def analyze_url(background_tasks: BackgroundTasks, body: AnalyzeRequest):
+    """Start analysis with a Notion URL as SRD source."""
+    if not body.srd_url:
+        raise HTTPException(status_code=400, detail="srd_url is required")
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "pending", "result": None, "error": None}
+    background_tasks.add_task(_run_analysis, job_id, body.srd_url, None, body.service_url)
+    return {"job_id": job_id}
+
+
+@app.post("/api/analyze/upload")
+async def analyze_upload(
+    background_tasks: BackgroundTasks,
+    service_url: str = Form(...),
+    srd_url: Optional[str] = Form(None),
+    srd_file: Optional[UploadFile] = File(None),
+):
+    """Start analysis with an uploaded Markdown file as SRD source."""
+    if not srd_file and not srd_url:
+        raise HTTPException(status_code=400, detail="Provide srd_file or srd_url")
+
+    job_id = str(uuid.uuid4())
+    _jobs[job_id] = {"status": "pending", "result": None, "error": None}
+
+    srd_content: Optional[str] = None
+    if srd_file:
+        raw = await srd_file.read()
+        srd_content = raw.decode("utf-8", errors="replace")
+
+    background_tasks.add_task(_run_analysis, job_id, srd_url, srd_content, service_url)
+    return {"job_id": job_id}
+
+
+@app.get("/api/status/{job_id}")
+async def get_status(job_id: str):
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _jobs[job_id]
+    return {"job_id": job_id, "status": job["status"], "error": job.get("error")}
+
+
+@app.get("/api/report/{job_id}")
+async def get_report(job_id: str):
+    if job_id not in _jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    job = _jobs[job_id]
+    if job["status"] in ("pending", "running"):
+        raise HTTPException(status_code=202, detail="Analysis still in progress")
+    if job["status"] == "error":
+        raise HTTPException(status_code=500, detail=job["error"])
+    return job["result"]
+
+
+@app.get("/")
+async def root():
+    return {"message": "SRD Compliance Bot API", "docs": "/docs"}
