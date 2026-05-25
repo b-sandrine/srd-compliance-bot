@@ -1,5 +1,7 @@
 from __future__ import annotations
 import uuid
+import asyncio
+import sys
 import os
 import logging
 import traceback
@@ -30,6 +32,8 @@ app.add_middleware(
 
 _jobs: dict = {}
 
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 async def _run_analysis(
     job_id: str,

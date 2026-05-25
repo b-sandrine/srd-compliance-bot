@@ -1,14 +1,10 @@
 from __future__ import annotations
 import asyncio
 import os
+import sys
 import time
 from typing import List
 
-# Use the SYNC Playwright API and run it inside asyncio.to_thread().
-# The async Playwright API calls asyncio.create_subprocess_exec, which requires
-# ProactorEventLoop — but uvicorn on Windows uses SelectorEventLoop, causing
-# NotImplementedError. The sync API manages its own subprocess transport and
-# works correctly when dispatched to a thread pool.
 from playwright.sync_api import sync_playwright, Page
 
 from .models import FormField, FieldType
@@ -194,11 +190,19 @@ def _try_login(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sync scraper — called inside asyncio.to_thread() to avoid the
-# ProactorEventLoop requirement of async Playwright on Windows
+# Sync scraper — called inside asyncio.to_thread()
 # ---------------------------------------------------------------------------
 
 def _scrape_sync(service_url: str) -> List[FormField]:
+    # sync_playwright internally creates an asyncio event loop inside a greenlet.
+    # On Windows that loop defaults to SelectorEventLoop, which cannot launch
+    # subprocesses (asyncio.create_subprocess_exec raises NotImplementedError).
+    # Setting a ProactorEventLoop on THIS thread before entering sync_playwright
+    # ensures the greenlet picks it up and Chromium can be spawned correctly.
+    if sys.platform == "win32":
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         context = browser.new_context(
