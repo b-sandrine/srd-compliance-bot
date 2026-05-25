@@ -125,8 +125,8 @@ def _extract_options(raw: str) -> List[str]:
 
     for line in raw.splitlines():
         stripped = line.strip()
-        # Match lines starting with - or • (bullet items)
-        m = re.match(r'^[-•]\s*(.*)', stripped)
+        # Match lines starting with - or • or * (bullet items)
+        m = re.match(r'^[-•*]\s*(.*)', stripped)
         if m:
             item = m.group(1).strip()
             # Strip markdown bold markers
@@ -170,7 +170,7 @@ _COL_KEYWORDS: Dict[str, List[str]] = {
     "hide_expression": ["hide", "condition", "expression", "visibility", "hide expression",
                         "show when", "visible when", "display rule", "display condition"],
     "validation":      ["validation", "rule", "constraint"],
-    "options":         ["option", "value", "choice", "enum", "placeholder"],
+    "options":         ["option", "value", "choice", "enum", "placeholder", "list of values"],
     "notes":           ["note", "description", "remark", "comment", "tooltip", "widget"],
     "section":         ["section"],
     "block":           ["block"],
@@ -191,17 +191,24 @@ def _build_col_map(headers: List[str]) -> dict:
 def _row_to_field(
     cells: List[str],
     col_map: dict,
-    section_ctx: str = "",
-    block_ctx: str = "",
+    state_ctx: dict,
 ) -> Optional[SRDField]:
     def get(key: str) -> str:
         idx = col_map.get(key)
         if idx is not None and idx < len(cells):
             return cells[idx].strip()
-        if key == "name" and cells:
-            return cells[0].strip()
         return ""
 
+    # 1. Update Section and Block structural contexts if explicitly provided
+    current_section = get("section")
+    current_block = get("block")
+    
+    if current_section:
+        state_ctx["section"] = current_section
+    if current_block:
+        state_ctx["block"] = current_block
+
+    # 2. Extract Field Name
     name = get("name")
     if not name:
         return None
@@ -210,11 +217,11 @@ def _row_to_field(
     if re.match(r'^[-:| ]+$', name):
         return None
 
-    # --- options ---
+    # 3. Process options & layout metadata
     options_raw = get("options")
     options = _extract_options(options_raw)
 
-    # --- validation + required ---
+    # 4. Process validations & conditional rules
     validation_raw = get("validation")
     validation_rules = [v.strip() for v in re.split(r"[;\n]", validation_raw) if v.strip()] if validation_raw else []
 
@@ -222,13 +229,8 @@ def _row_to_field(
     if required_val is None and validation_raw:
         required_val = _required_from_validation(validation_raw)
 
-    # --- hide expression from display rules ---
     hide_raw = get("hide_expression")
     hide_expr = _clean_display_rule(hide_raw)
-
-    # --- section / block context (use cell value or carry-forward context) ---
-    section = get("section") or section_ctx
-    block = get("block") or block_ctx
 
     return SRDField(
         name=name,
@@ -239,8 +241,8 @@ def _row_to_field(
         validation_rules=validation_rules,
         options=options,
         notes=get("notes") or None,
-        section=section or None,
-        block=block or None,
+        section=state_ctx.get("section") or None,
+        block=state_ctx.get("block") or None,
     )
 
 
@@ -266,14 +268,11 @@ async def _parse_notion_table(notion: NotionClient, table_block: dict) -> List[S
 
     col_map = _build_col_map(headers)
     fields = []
-    section_ctx = block_ctx = ""
+    state_ctx = {"section": "", "block": ""}
+    
     for row in data:
-        f = _row_to_field(row, col_map, section_ctx, block_ctx)
+        f = _row_to_field(row, col_map, state_ctx)
         if f:
-            if f.section:
-                section_ctx = f.section
-            if f.block:
-                block_ctx = f.block
             fields.append(f)
     return fields
 
@@ -301,7 +300,7 @@ async def _parse_notion_page(page_id: str) -> List[SRDField]:
 # ---------------------------------------------------------------------------
 
 def _parse_markdown_tables(content: str) -> List[Tuple[List[str], List[List[str]]]]:
-    """Extract (headers, rows) tuples from raw markdown table syntax."""
+    """Extract (headers, rows) tuples from raw markdown table syntax, stitching continuous rows."""
     tables = []
     lines = content.splitlines()
     i = 0
@@ -312,14 +311,31 @@ def _parse_markdown_tables(content: str) -> List[Tuple[List[str], List[List[str]
             while i < len(lines) and lines[i].strip().startswith("|"):
                 block.append(lines[i].strip())
                 i += 1
-            if len(block) < 2:
+            if len(block) < 3:
                 continue
+                
             headers = [c.strip() for c in block[0].split("|")[1:-1]]
+            
             data_rows: List[List[str]] = []
             for row_line in block[2:]:  # skip separator row (index 1)
                 row = [c.strip() for c in row_line.split("|")[1:-1]]
-                if any(row):
-                    data_rows.append(row)
+                
+                # Check if this row is a continuation row (e.g., hanging list value)
+                is_continuation = False
+                if len(data_rows) > 0:
+                    non_empty_indices = [idx for idx, cell in enumerate(row) if cell]
+                    # If only 1 column contains text, and it's a bullet point continuation
+                    if len(non_empty_indices) == 1 and row[non_empty_indices[0]].startswith(('*', '-', '•')):
+                        is_continuation = True
+                        target_col = non_empty_indices[0]
+                
+                if is_continuation and data_rows:
+                    # Append bullet criteria text up to the active target element
+                    data_rows[-1][target_col] += "\n" + row[target_col]
+                else:
+                    if any(row):
+                        data_rows.append(row)
+                        
             tables.append((headers, data_rows))
         else:
             i += 1
@@ -365,20 +381,17 @@ def extract_metadata(content: str) -> Dict[str, Any]:
 
 async def parse_markdown(content: str) -> List[SRDField]:
     fields: List[SRDField] = []
+    state_ctx = {"section": "", "block": ""}
+    
     for headers, rows in _parse_markdown_tables(content):
         col_map = _build_col_map(headers)
         # Only process tables that look like form-field tables
-        # (must have a "name" or "field name" column)
         if "name" not in col_map:
             continue
-        section_ctx = block_ctx = ""
+            
         for row in rows:
-            f = _row_to_field(row, col_map, section_ctx, block_ctx)
+            f = _row_to_field(row, col_map, state_ctx)
             if f:
-                if f.section:
-                    section_ctx = f.section
-                if f.block:
-                    block_ctx = f.block
                 fields.append(f)
     return fields
 
