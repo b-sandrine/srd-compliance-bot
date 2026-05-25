@@ -15,25 +15,44 @@ function StatusBanner({ msg }) {
   );
 }
 
+function ErrorPanel({ title, message, onDismiss }) {
+  if (!message) return null;
+  return (
+    <div className="bg-rose-950/40 border border-rose-700 rounded-xl p-5 space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <h3 className="text-rose-400 font-bold text-sm">{title}</h3>
+        <button onClick={onDismiss} className="text-rose-600 hover:text-rose-400 text-lg leading-none">×</button>
+      </div>
+      <pre className="text-rose-300 text-xs font-mono whitespace-pre-wrap break-all bg-rose-950/60 rounded-lg p-3 max-h-64 overflow-y-auto">
+        {message}
+      </pre>
+    </div>
+  );
+}
+
 export default function App() {
   // Phase 1 — SRD parsing
-  const [srdData, setSrdData] = useState(null);      // parsed SRD result
+  const [srdData, setSrdData] = useState(null);
   const [srdLoading, setSrdLoading] = useState(false);
   const [srdStatus, setSrdStatus] = useState('');
+  const [srdError, setSrdError] = useState('');
 
   // Phase 2 — full audit
   const [reportData, setReportData] = useState(null);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditStatus, setAuditStatus] = useState('');
+  const [auditError, setAuditError] = useState('');
 
   // Stored params so SRDPreview can trigger the audit without re-entering inputs
-  const [auditParams, setAuditParams] = useState(null); // { serviceUrl, srdUrl, srdFile }
+  const [auditParams, setAuditParams] = useState(null);
 
   // ---- Phase 1: parse SRD ------------------------------------------------
   const handleParseSRD = async (serviceUrl, srdUrl, srdFile) => {
     setSrdLoading(true);
     setSrdData(null);
     setReportData(null);
+    setSrdError('');
+    setAuditError('');
     setSrdStatus('Parsing SRD document…');
 
     const fd = new FormData();
@@ -44,13 +63,13 @@ export default function App() {
       const res = await fetch(`${API}/api/parse-srd`, { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) {
-        alert(data.detail || 'Failed to parse SRD.');
+        setSrdError(data.detail || 'Failed to parse SRD.');
         return;
       }
       setSrdData(data);
       setAuditParams({ serviceUrl, srdUrl, srdFile });
-    } catch {
-      alert('Cannot reach the backend server.');
+    } catch (err) {
+      setSrdError(`Cannot reach the backend server.\n${err}`);
     } finally {
       setSrdLoading(false);
       setSrdStatus('');
@@ -64,6 +83,7 @@ export default function App() {
 
     setAuditLoading(true);
     setReportData(null);
+    setAuditError('');
     setAuditStatus('Submitting audit job…');
 
     const fd = new FormData();
@@ -75,7 +95,7 @@ export default function App() {
       const res = await fetch(`${API}/api/analyze`, { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok) {
-        alert(data.detail || 'Failed to start audit.');
+        setAuditError(data.detail || 'Failed to start audit.');
         return;
       }
 
@@ -94,15 +114,15 @@ export default function App() {
           setAuditStatus('');
           break;
         } else if (statusData.status === 'error') {
-          alert(`Audit failed: ${statusData.error}`);
+          setAuditError(statusData.error || 'Unknown error — check the backend terminal for the full traceback.');
           setAuditStatus('');
           break;
         } else {
-          setAuditStatus(`Analysis running — scraping & comparing…`);
+          setAuditStatus('Analysis running — scraping & comparing…');
         }
       }
-    } catch {
-      alert('Cannot reach the backend server.');
+    } catch (err) {
+      setAuditError(`Cannot reach the backend server.\n${err}`);
       setAuditStatus('');
     } finally {
       setAuditLoading(false);
@@ -121,11 +141,13 @@ export default function App() {
         <FormSubmission onParseSRD={handleParseSRD} loading={srdLoading} />
 
         {srdStatus && <StatusBanner msg={srdStatus} />}
+        <ErrorPanel title="SRD Parse Error" message={srdError} onDismiss={() => setSrdError('')} />
 
         {/* Step 2: SRD preview */}
         {srdData && (
           <>
             {auditStatus && <StatusBanner msg={auditStatus} />}
+            <ErrorPanel title="Audit Error" message={auditError} onDismiss={() => setAuditError('')} />
             <SRDPreview
               srdData={srdData}
               serviceUrl={auditParams?.serviceUrl}

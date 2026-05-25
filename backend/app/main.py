@@ -1,8 +1,13 @@
 from __future__ import annotations
 import uuid
 import os
+import logging
+import traceback
 from typing import Optional
 from dotenv import load_dotenv
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
@@ -49,8 +54,11 @@ async def _run_analysis(
         _jobs[job_id]["status"] = "complete"
         _jobs[job_id]["result"] = report.model_dump()
     except Exception as exc:
+        tb = traceback.format_exc()
+        logger.error("Analysis job %s failed:\n%s", job_id, tb)
         _jobs[job_id]["status"] = "error"
-        _jobs[job_id]["error"] = str(exc)
+        # Store full traceback so the frontend can show the real cause
+        _jobs[job_id]["error"] = f"{type(exc).__name__}: {exc}\n\n{tb}"
 
 
 @app.post("/api/parse-srd")

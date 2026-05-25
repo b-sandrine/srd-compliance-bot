@@ -1,8 +1,15 @@
 from __future__ import annotations
 import asyncio
 import os
+import time
 from typing import List
-from playwright.async_api import async_playwright, Page
+
+# Use the SYNC Playwright API and run it inside asyncio.to_thread().
+# The async Playwright API calls asyncio.create_subprocess_exec, which requires
+# ProactorEventLoop — but uvicorn on Windows uses SelectorEventLoop, causing
+# NotImplementedError. The sync API manages its own subprocess transport and
+# works correctly when dispatched to a thread pool.
+from playwright.sync_api import sync_playwright, Page
 
 from .models import FormField, FieldType
 
@@ -31,7 +38,7 @@ def _infer_type(raw: str) -> FieldType:
 
 
 # ---------------------------------------------------------------------------
-# JavaScript injected into the page to extract all form field metadata
+# JavaScript injected into the page to extract form field metadata
 # ---------------------------------------------------------------------------
 
 _EXTRACT_JS = """
@@ -84,7 +91,6 @@ _EXTRACT_JS = """
                     return attr + ': ' + val;
                 }
             }
-            // Angular *ngIf is stored as comment nodes — check sibling comments
             node = node.parentElement;
         }
         return null;
@@ -138,7 +144,6 @@ _EXTRACT_JS = """
     ].join(', ');
 
     document.querySelectorAll(customSelectors).forEach(el => {
-        // Skip if standard input already captured
         if (el.querySelector('input, select, textarea')) return;
 
         const lblEl = el.querySelector('label, .label, [class*="label"], .field-label');
@@ -157,40 +162,46 @@ _EXTRACT_JS = """
         });
     });
 
-    return fields;
+    // Deduplicate by (name, label) in JS before returning
+    const seen = new Set();
+    return fields.filter(f => {
+        const key = (f.name || '') + '||' + (f.label || '');
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 """
 
 
 # ---------------------------------------------------------------------------
-# Optional login step
+# Optional login step (sync version)
 # ---------------------------------------------------------------------------
 
-async def _try_login(page: Page, service_url: str) -> None:
-    username = os.getenv("SERVICE_USERNAME", "")
-    password = os.getenv("SERVICE_PASSWORD", "")
+def _try_login(page: Page) -> None:
+    username = os.getenv("SERVICE_USERNAME", "") or '0789709595'
+    password = os.getenv("SERVICE_PASSWORD", "") or 'Test@123'
     if not username or not password:
         return
-
     try:
-        # Try common login field patterns
-        if await page.locator('input[type="email"], input[name="email"], input[name="username"]').count():
-            await page.fill('input[type="email"], input[name="email"], input[name="username"]', username)
-            await page.fill('input[type="password"]', password)
-            await page.click('button[type="submit"], input[type="submit"], .login-btn, .btn-login')
-            await page.wait_for_load_state("networkidle", timeout=15000)
+        if page.locator('input[type="email"], input[name="email"], input[name="username"]').count():
+            page.fill('input[type="email"], input[name="email"], input[name="username"]', username)
+            page.fill('input[type="password"]', password)
+            page.click('button[type="submit"], input[type="submit"], .login-btn, .btn-login')
+            page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
-        pass  # Best-effort; continue without auth
+        pass
 
 
 # ---------------------------------------------------------------------------
-# Public entry point
+# Sync scraper — called inside asyncio.to_thread() to avoid the
+# ProactorEventLoop requirement of async Playwright on Windows
 # ---------------------------------------------------------------------------
 
-async def scrape_service(service_url: str) -> List[FormField]:
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = await browser.new_context(
+def _scrape_sync(service_url: str) -> List[FormField]:
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        context = browser.new_context(
             viewport={"width": 1440, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -198,42 +209,32 @@ async def scrape_service(service_url: str) -> List[FormField]:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        page = await context.new_page()
+        page = context.new_page()
         try:
-            await page.goto(service_url, wait_until="domcontentloaded", timeout=30000)
-            await _try_login(page, service_url)
+            page.goto(service_url, wait_until="domcontentloaded", timeout=30000)
+            _try_login(page)
 
-            # Wait for any form to settle
             try:
-                await page.wait_for_selector(
+                page.wait_for_selector(
                     "form, [role='form'], .form-container, .application-form, "
                     "[formlyfield], mat-form-field, nz-form-item",
                     timeout=12000,
                 )
             except Exception:
-                pass  # No known form container; continue anyway
+                pass
 
-            # Extra wait for dynamic frameworks to render
-            await asyncio.sleep(2)
+            time.sleep(2)  # allow dynamic frameworks to settle
 
-            raw_fields: list = await page.evaluate(_EXTRACT_JS)
+            raw_fields: list = page.evaluate(_EXTRACT_JS)
         finally:
-            await browser.close()
+            browser.close()
 
     form_fields: List[FormField] = []
-    seen: set = set()
-
     for fd in raw_fields:
         name = fd.get("name") or ""
         label = fd.get("label") or ""
         if not name and not label:
             continue
-
-        # Deduplicate by (name, label) pair
-        key = (name.lower(), label.lower())
-        if key in seen:
-            continue
-        seen.add(key)
 
         form_fields.append(FormField(
             name=name or None,
@@ -247,3 +248,12 @@ async def scrape_service(service_url: str) -> List[FormField]:
         ))
 
     return form_fields
+
+
+# ---------------------------------------------------------------------------
+# Public async entry point
+# ---------------------------------------------------------------------------
+
+async def scrape_service(service_url: str) -> List[FormField]:
+    """Run the sync Playwright scraper in a thread pool to keep the async loop unblocked."""
+    return await asyncio.to_thread(_scrape_sync, service_url)
