@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import os
+import re
 import sys
 import time
 from typing import List
@@ -11,17 +12,18 @@ from .models import FormField, FieldType
 
 
 _TYPE_MAP = {
-    "text": FieldType.TEXT,
-    "number": FieldType.NUMBER,
-    "date": FieldType.DATE,
+    "dropdown": FieldType.DROPDOWN,
+    "select":   FieldType.DROPDOWN,
+    "date":     FieldType.DATE,
     "datetime-local": FieldType.DATE,
-    "select": FieldType.DROPDOWN,
-    "file": FieldType.FILE,
+    "file":     FieldType.FILE,
     "checkbox": FieldType.CHECKBOX,
-    "radio": FieldType.RADIO,
+    "radio":    FieldType.RADIO,
     "textarea": FieldType.TEXTAREA,
-    "email": FieldType.EMAIL,
-    "tel": FieldType.PHONE,
+    "email":    FieldType.EMAIL,
+    "tel":      FieldType.PHONE,
+    "number":   FieldType.NUMBER,
+    "text":     FieldType.TEXT,
 }
 
 
@@ -34,157 +36,245 @@ def _infer_type(raw: str) -> FieldType:
 
 
 # ---------------------------------------------------------------------------
-# JavaScript injected into the page to extract form field metadata
+# JavaScript injected into the page — targets NZ-ZORRO (Ant Design for Angular)
+# which is what IremboGov uses, with a standard-HTML fallback.
 # ---------------------------------------------------------------------------
 
 _EXTRACT_JS = """
 () => {
     const fields = [];
+    const seen  = new Set();
 
-    function getLabel(el) {
-        if (el.id) {
-            const lbl = document.querySelector('label[for="' + el.id + '"]');
-            if (lbl) return lbl.innerText.trim();
-        }
-        const ariaLabel = el.getAttribute('aria-label');
-        if (ariaLabel) return ariaLabel.trim();
+    // ---- helpers -----------------------------------------------------------
 
-        const labelledBy = el.getAttribute('aria-labelledby');
-        if (labelledBy) {
-            const lblEl = document.getElementById(labelledBy);
-            if (lblEl) return lblEl.innerText.trim();
-        }
-
-        const parent = el.closest(
-            '.form-group, .form-field, [class*="field"], [class*="input-group"],' +
-            ' .ant-form-item, .mat-form-field, .MuiFormControl-root,' +
-            ' nz-form-item, .el-form-item, [formlyfield], [formly-field]'
-        );
-        if (parent) {
-            const lblEl = parent.querySelector('label, .label, [class*="label"], .field-label');
-            if (lblEl && lblEl !== el) return lblEl.innerText.trim();
-        }
-
-        return el.placeholder || el.getAttribute('data-label') || el.name || null;
+    function labelText(el) {
+        if (!el) return null;
+        // Strip trailing asterisk (required marker) and whitespace
+        return el.innerText.trim().replace(/\\s*[*✱]\\s*$/, '').trim() || null;
     }
 
-    function getHideExpression(el) {
-        const attrs = [
-            'ng-if', 'ng-show', 'ng-hide',
-            'data-ng-if', 'data-ng-show', 'data-ng-hide',
-            'v-if', 'v-show',
-            'data-hide', 'data-show', 'data-condition',
-            'data-hide-expression', 'data-visible-when',
-            'formly-hide-expression', 'data-formly-hide-expression',
-            '[hidden]', 'hidden'
+    function getLabel(container) {
+        const selectors = [
+            '.ant-form-item-label > label',
+            'nz-form-label label',
+            '.ant-form-item-label label',
+            'label',
         ];
-        let node = el;
-        for (let depth = 0; depth < 6; depth++) {
-            if (!node) break;
+        for (const sel of selectors) {
+            const el = container.querySelector(sel);
+            const t  = labelText(el);
+            if (t) return t;
+        }
+        return null;
+    }
+
+    function getFieldName(container) {
+        const attrs = ['formcontrolname', 'ng-reflect-name', 'data-field-name', 'name'];
+        // Check the container itself then every descendant
+        const candidates = [container, ...container.querySelectorAll('*')];
+        for (const el of candidates) {
             for (const attr of attrs) {
-                const val = node.getAttribute(attr);
-                if (val && val !== 'false' && val !== '') {
-                    return attr + ': ' + val;
+                const v = el.getAttribute(attr);
+                if (v && v.trim() && !v.startsWith('_ng') && v !== 'undefined') {
+                    return v.trim();
                 }
+            }
+        }
+        // Fallback: id of the first real input inside
+        const inp = container.querySelector('input[id], select[id], textarea[id]');
+        if (inp) return inp.id || null;
+        return null;
+    }
+
+    function getType(container) {
+        if (container.querySelector('nz-select, .ant-select:not(.ant-picker)'))   return 'dropdown';
+        if (container.querySelector('nz-date-picker, nz-time-picker, .ant-picker')) return 'date';
+        if (container.querySelector('nz-upload, .ant-upload'))                     return 'file';
+        if (container.querySelector('nz-radio-group, .ant-radio-wrapper'))         return 'radio';
+        if (container.querySelector('nz-checkbox, .ant-checkbox-wrapper'))         return 'checkbox';
+        if (container.querySelector('nz-input-number, .ant-input-number'))         return 'number';
+        const inp = container.querySelector('input');
+        if (inp) {
+            const t = (inp.type || 'text').toLowerCase();
+            if (t === 'hidden' || t === 'submit' || t === 'button') return 'unknown';
+            return t;
+        }
+        if (container.querySelector('textarea')) return 'textarea';
+        return 'unknown';
+    }
+
+    function isRequired(container) {
+        if (container.querySelector(
+            '.ant-form-item-required, [ng-reflect-nz-required="true"], [nzrequired]'
+        )) return true;
+        const lbl = container.querySelector('label');
+        if (lbl && lbl.classList.contains('ant-form-item-required')) return true;
+        const inp = container.querySelector('input, select, textarea');
+        return !!(inp && (inp.required || inp.getAttribute('aria-required') === 'true'));
+    }
+
+    function isVisible(el) {
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' &&
+               parseFloat(s.opacity) > 0 && el.offsetParent !== null;
+    }
+
+    function getHide(container) {
+        const attrs = ['ng-if', 'data-ng-if', 'ng-show', 'data-ng-show', '*ngif'];
+        let node = container;
+        for (let d = 0; d < 6; d++) {
+            if (!node) break;
+            for (const a of attrs) {
+                const v = node.getAttribute(a);
+                if (v && v !== 'false' && v !== '') return a + ': ' + v;
             }
             node = node.parentElement;
         }
         return null;
     }
 
-    function isVisible(el) {
-        const style = window.getComputedStyle(el);
-        return style.display !== 'none' &&
-               style.visibility !== 'hidden' &&
-               parseFloat(style.opacity) > 0 &&
-               el.offsetParent !== null;
+    function getOptions(container) {
+        const opts = [];
+        // NZ-ZORRO select options visible in the DOM
+        container.querySelectorAll('.ant-select-item-option-content').forEach(o => {
+            const t = o.innerText.trim();
+            if (t) opts.push(t);
+        });
+        // Standard <select> options
+        container.querySelectorAll('option').forEach(o => {
+            if (o.value) opts.push(o.innerText.trim());
+        });
+        return opts;
     }
 
-    function getOptions(el) {
-        if (el.tagName === 'SELECT') {
-            return Array.from(el.options)
-                .filter(o => o.value !== '')
-                .map(o => o.text.trim());
-        }
-        return [];
-    }
-
-    // Standard HTML inputs
-    document.querySelectorAll('input, select, textarea').forEach(el => {
-        const t = (el.type || '').toLowerCase();
-        if (['hidden', 'submit', 'button', 'reset', 'image'].includes(t)) return;
-
-        fields.push({
-            name: el.name || el.id || null,
-            label: getLabel(el),
-            type: el.tagName === 'SELECT' ? 'select' : (el.tagName === 'TEXTAREA' ? 'textarea' : t),
-            required: el.required || el.getAttribute('aria-required') === 'true',
-            visible: isVisible(el),
-            hide_expression: getHideExpression(el),
-            options: getOptions(el),
-            attributes: {
-                placeholder: el.placeholder || null,
-                'data-field-name': el.getAttribute('data-field-name'),
-                'data-name': el.getAttribute('data-name'),
-                'data-field-type': el.getAttribute('data-field-type'),
-                class: el.className || null,
-            }
-        });
-    });
-
-    // Custom / framework components that wrap inputs
-    const customSelectors = [
-        '[formlyfield]', '[formly-field]', '.formly-field',
-        'mat-form-field', 'nz-form-item', 'el-form-item',
-        '[data-field-type]', '[data-component-type="field"]',
-    ].join(', ');
-
-    document.querySelectorAll(customSelectors).forEach(el => {
-        if (el.querySelector('input, select, textarea')) return;
-
-        const lblEl = el.querySelector('label, .label, [class*="label"], .field-label');
-        fields.push({
-            name: el.getAttribute('data-field-name') || el.getAttribute('name') || el.id || null,
-            label: lblEl ? lblEl.innerText.trim() : null,
-            type: el.getAttribute('data-field-type') || el.getAttribute('data-component-type') || 'custom',
-            required: el.getAttribute('data-required') === 'true' || el.hasAttribute('required'),
-            visible: isVisible(el),
-            hide_expression: getHideExpression(el),
-            options: [],
-            attributes: {
-                class: el.className || null,
-                'data-field-type': el.getAttribute('data-field-type'),
-            }
-        });
-    });
-
-    // Deduplicate by (name, label) in JS before returning
-    const seen = new Set();
-    return fields.filter(f => {
-        const key = (f.name || '') + '||' + (f.label || '');
-        if (seen.has(key)) return false;
+    function push(name, label, type, required, visible, hide, options, attrs) {
+        if (!name && !label) return;
+        const key = (name || '') + '||' + (label || '');
+        if (seen.has(key)) return;
         seen.add(key);
-        return true;
+        fields.push({ name, label, type, required, visible,
+                      hide_expression: hide, options, attributes: attrs });
+    }
+
+    // ---- Strategy 1: NZ-ZORRO .ant-form-item / nz-form-item ---------------
+    document.querySelectorAll('.ant-form-item, nz-form-item').forEach(item => {
+        const hasControl = item.querySelector(
+            'input, select, textarea, nz-select, nz-date-picker, nz-upload,' +
+            ' nz-radio-group, nz-checkbox, nz-input-number, nz-time-picker'
+        );
+        if (!hasControl) return;
+
+        push(
+            getFieldName(item),
+            getLabel(item),
+            getType(item),
+            isRequired(item),
+            isVisible(item),
+            getHide(item),
+            getOptions(item),
+            { class: item.className || null }
+        );
     });
+
+    // ---- Strategy 2: Angular Formly fields (if NZ-ZORRO didn't fire) -------
+    if (fields.length === 0) {
+        document.querySelectorAll('formly-field, [formlyfield]').forEach(item => {
+            const hasControl = item.querySelector('input, select, textarea');
+            if (!hasControl) return;
+            push(
+                getFieldName(item) || item.getAttribute('ng-reflect-key'),
+                getLabel(item),
+                getType(item),
+                isRequired(item),
+                isVisible(item),
+                getHide(item),
+                getOptions(item),
+                {}
+            );
+        });
+    }
+
+    // ---- Strategy 3: plain HTML inputs (ultimate fallback) -----------------
+    if (fields.length === 0) {
+        document.querySelectorAll('input, select, textarea').forEach(el => {
+            const t = (el.type || '').toLowerCase();
+            if (['hidden','submit','button','reset','image'].includes(t)) return;
+
+            let lbl = null;
+            if (el.id) {
+                const l = document.querySelector('label[for="' + el.id + '"]');
+                if (l) lbl = labelText(l);
+            }
+            if (!lbl) {
+                const parent = el.closest('.form-group, .form-field, [class*="field"]');
+                if (parent) { const l = parent.querySelector('label'); if (l) lbl = labelText(l); }
+            }
+            if (!lbl) lbl = el.getAttribute('aria-label') || el.placeholder || null;
+
+            const name = el.name || el.id || null;
+            push(
+                name, lbl,
+                el.tagName === 'SELECT' ? 'select' : el.tagName === 'TEXTAREA' ? 'textarea' : t,
+                el.required || el.getAttribute('aria-required') === 'true',
+                isVisible(el),
+                null,
+                el.tagName === 'SELECT'
+                    ? Array.from(el.options).filter(o => o.value).map(o => o.text.trim())
+                    : [],
+                { placeholder: el.placeholder || null }
+            );
+        });
+    }
+
+    return fields;
 }
 """
 
 
 # ---------------------------------------------------------------------------
-# Optional login step (sync version)
+# Language helpers
+# ---------------------------------------------------------------------------
+
+def _with_lang_en(url: str) -> str:
+    if "lang=en" in url:
+        return url
+    if re.search(r'[?&]lang=', url):
+        return re.sub(r'(lang=)[^&]+', r'\1en', url)
+    sep = '&' if '?' in url else '?'
+    return f"{url}{sep}lang=en"
+
+
+def _ensure_english(page: Page) -> None:
+    try:
+        if "lang=en" not in page.url:
+            page.goto(_with_lang_en(page.url), wait_until="domcontentloaded", timeout=15000)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Login step
 # ---------------------------------------------------------------------------
 
 def _try_login(page: Page) -> None:
-    username = os.getenv("SERVICE_USERNAME", "") or '0789709595'
-    password = os.getenv("SERVICE_PASSWORD", "") or 'Test@123'
+    username = os.getenv("SERVICE_USERNAME", "") or "0789709595"
+    password = os.getenv("SERVICE_PASSWORD", "") or "Test@123"
     if not username or not password:
         return
     try:
-        if page.locator('input[type="email"], input[name="email"], input[name="username"]').count():
-            page.fill('input[type="email"], input[name="email"], input[name="username"]', username)
+        # IremboGov uses phone number input; also accept email/username fields
+        user_sel = (
+            'input[type="tel"], input[name="phone"], input[id*="phone"], '
+            'input[type="email"], input[name="email"], input[name="username"]'
+        )
+        if page.locator(user_sel).count():
+            page.fill(user_sel, username)
             page.fill('input[type="password"]', password)
-            page.click('button[type="submit"], input[type="submit"], .login-btn, .btn-login')
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.click(
+                'button[type="submit"], input[type="submit"], '
+                '.login-btn, .btn-login, button:has-text("Login"), button:has-text("Sign in")'
+            )
+            page.wait_for_load_state("networkidle", timeout=20000)
     except Exception:
         pass
 
@@ -194,54 +284,68 @@ def _try_login(page: Page) -> None:
 # ---------------------------------------------------------------------------
 
 def _scrape_sync(service_url: str) -> List[FormField]:
-    # sync_playwright internally creates an asyncio event loop inside a greenlet.
-    # On Windows that loop defaults to SelectorEventLoop, which cannot launch
-    # subprocesses (asyncio.create_subprocess_exec raises NotImplementedError).
-    # Setting a ProactorEventLoop on THIS thread before entering sync_playwright
-    # ensures the greenlet picks it up and Chromium can be spawned correctly.
+    # On Windows, sync_playwright's internal greenlet needs ProactorEventLoop
+    # to be able to spawn Chromium subprocesses.
     if sys.platform == "win32":
         loop = asyncio.ProactorEventLoop()
         asyncio.set_event_loop(loop)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+
+        # Inject lang cookie before any navigation so the server sends English HTML
+        parsed = re.search(r'https?://([^/]+)', service_url)
+        domain = parsed.group(1) if parsed else ""
+
         context = browser.new_context(
             viewport={"width": 1440, "height": 900},
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
+        if domain:
+            context.add_cookies([
+                {"name": "lang",     "value": "en", "domain": domain, "path": "/"},
+                {"name": "language", "value": "en", "domain": domain, "path": "/"},
+            ])
+
         page = context.new_page()
         try:
-            page.goto(service_url, wait_until="domcontentloaded", timeout=30000)
+            # Navigate with lang=en baked into the URL
+            page.goto(_with_lang_en(service_url), wait_until="domcontentloaded", timeout=30000)
             _try_login(page)
+            _ensure_english(page)  # re-apply if login redirect dropped lang param
 
+            # Wait for NZ-ZORRO or standard form elements to appear
             try:
                 page.wait_for_selector(
-                    "form, [role='form'], .form-container, .application-form, "
-                    "[formlyfield], mat-form-field, nz-form-item",
-                    timeout=12000,
+                    ".ant-form-item, nz-form-item, "
+                    "form, [role='form'], [formlyfield], mat-form-field",
+                    timeout=15000,
                 )
             except Exception:
                 pass
 
-            time.sleep(2)  # allow dynamic frameworks to settle
+            # Extra settle time for Angular change detection to finish rendering
+            time.sleep(3)
 
-            raw_fields: list = page.evaluate(_EXTRACT_JS)
+            raw_fields: list = page.evaluate(_EXTRACT_JS) or []
         finally:
             browser.close()
 
     form_fields: List[FormField] = []
     for fd in raw_fields:
-        name = fd.get("name") or ""
+        name  = fd.get("name")  or ""
         label = fd.get("label") or ""
         if not name and not label:
             continue
 
         form_fields.append(FormField(
-            name=name or None,
+            name=name   or None,
             label=label or None,
             field_type=_infer_type(fd.get("type", "")),
             required=bool(fd.get("required", False)),

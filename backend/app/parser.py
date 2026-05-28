@@ -40,7 +40,6 @@ def _rich_text(cell: list) -> str:
 # ---------------------------------------------------------------------------
 
 _TYPE_MAP = {
-    # Standard
     "text input": FieldType.TEXT,
     "text area": FieldType.TEXTAREA,
     "textarea": FieldType.TEXTAREA,
@@ -80,7 +79,11 @@ _TYPE_MAP = {
     "phone": FieldType.PHONE,
     "tel": FieldType.PHONE,
     "telephone": FieldType.PHONE,
-    # IremboGov-specific widget types
+    "dropdown selector": FieldType.DROPDOWN,
+    "information list": FieldType.TEXT,   
+    "nid widget": FieldType.TEXT,
+    "tin widget": FieldType.TEXT,
+    "id widget": FieldType.TEXT,
     "tin fetch": FieldType.TEXT,
     "tin": FieldType.TEXT,
     "id fetch": FieldType.TEXT,
@@ -90,7 +93,6 @@ _TYPE_MAP = {
 
 def _infer_type(raw: str) -> FieldType:
     low = raw.lower().strip()
-    # Longest-match first to avoid "text" matching "text input" incorrectly
     for key in sorted(_TYPE_MAP.keys(), key=len, reverse=True):
         if key in low:
             return _TYPE_MAP[key]
@@ -99,15 +101,16 @@ def _infer_type(raw: str) -> FieldType:
 
 def _infer_required(raw: str) -> Optional[bool]:
     low = raw.lower().strip()
+    if not low:
+        return None  
     if low in ("yes", "true", "required", "mandatory", "y", "1", "✓", "✔"):
         return True
-    if low in ("no", "false", "optional", "n", "0", "–", "-", ""):
+    if low in ("no", "false", "optional", "n", "0", "–", "-"):
         return False
     return None
 
 
 def _required_from_validation(validation_raw: str) -> Optional[bool]:
-    """Infer required status from validation rules column (e.g. '-Required', '-Optional')."""
     low = validation_raw.lower()
     if re.search(r"\brequired\b", low) and not re.search(r"\boptional\b", low):
         return True
@@ -117,43 +120,34 @@ def _required_from_validation(validation_raw: str) -> Optional[bool]:
 
 
 def _extract_options(raw: str) -> List[str]:
-    """Extract list values from a cell that may contain placeholder text + bullet list."""
     if not raw:
         return []
 
     options: List[str] = []
-
-    for line in raw.splitlines():
+    # Strip common structural header noise inside the cells
+    clean_raw = re.sub(r'(placeholder|list of values|dropdown values|values?):', '', raw, flags=re.IGNORECASE).strip()
+    
+    for line in clean_raw.splitlines():
         stripped = line.strip()
-        # Match lines starting with - or • or * (bullet items)
-        m = re.match(r'^[-•*]\s*(.*)', stripped)
+        # Clean off numbered lists (1. Text) or bullet arrays (- Text / * Text)
+        m = re.match(r'^(?:\d+[\.\)]|[-•*])\s*(.*)', stripped)
         if m:
             item = m.group(1).strip()
-            # Strip markdown bold markers
-            item = re.sub(r'\*\*([^*]+)\*\*', r'\1', item).strip()
-            if item:
-                options.append(item)
-
-    # Fallback: comma/semicolon list after "values:" label
-    if not options:
-        m = re.search(r'(?:values?|options?|choices?)\s*[:\-]\s*(.+)', raw, re.IGNORECASE | re.DOTALL)
-        if m:
-            blob = m.group(1)
-            options = [
-                re.sub(r'\*\*([^*]+)\*\*', r'\1', v).strip()
-                for v in re.split(r'[,;]', blob)
-                if v.strip() and not v.strip().startswith('**')
-            ]
+        else:
+            item = stripped
+            
+        item = re.sub(r'\*\*([^*]+)\*\*', r'\1', item).strip()
+        if item and item.lower() not in ("n/a", "na", ""):
+            options.append(item)
 
     return [o for o in options if o]
 
 
 def _clean_display_rule(raw: str) -> Optional[str]:
-    """Return None if field is always visible, else return the display condition."""
     if not raw:
         return None
     low = raw.lower().strip()
-    if low in ("", "always on display", "always displayed", "always visible", "n/a", "-"):
+    if low in ("", "always on display", "always displayed", "always visible", "n/a", "na", "-"):
         return None
     return raw.strip()
 
@@ -163,18 +157,19 @@ def _clean_display_rule(raw: str) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 _COL_KEYWORDS: Dict[str, List[str]] = {
-    "name":            ["field name", "field", "component", "name", "key"],
-    "label":           ["label", "display name", "display", "title"],
-    "type":            ["type", "field type", "data type", "input type"],
-    "required":        ["required", "mandatory", "obligatory"],
-    "hide_expression": ["hide", "condition", "expression", "visibility", "hide expression",
-                        "show when", "visible when", "display rule", "display condition"],
-    "validation":      ["validation", "rule", "constraint"],
-    "options":         ["option", "value", "choice", "enum", "placeholder", "list of values"],
-    "notes":           ["note", "description", "remark", "comment", "tooltip", "widget"],
     "section":         ["section"],
     "block":           ["block"],
+    "name":            ["field name", "component name", "name", "key"],
+    "label":           ["label", "display name", "title"],
+    "type":            ["field type", "data type", "input type", "type"],
+    "required":        ["required", "mandatory", "obligatory"],
+    "options":         ["list of values", "placeholder", "option", "choice", "enum", "value"],
+    "notes":           ["tooltip", "hint", "note", "remark", "comment", "description"],
+    "widget_req":      ["widget requirement", "widget"],
+    "validation":      ["validation rule", "validation", "constraint"],
     "error":           ["error message", "error"],
+    "hide_expression": ["display rule", "display condition", "hide expression",
+                        "show when", "visible when", "hide", "condition", "visibility"],
 }
 
 
@@ -187,94 +182,189 @@ def _build_col_map(headers: List[str]) -> dict:
                 col_map[key] = idx
     return col_map
 
+# ---------------------------------------------------------------------------
+# Core Stateful Transformer Engine
+# ---------------------------------------------------------------------------
 
-def _row_to_field(
-    cells: List[str],
-    col_map: dict,
-    state_ctx: dict,
-) -> Optional[SRDField]:
-    def get(key: str) -> str:
-        idx = col_map.get(key)
-        if idx is not None and idx < len(cells):
-            return cells[idx].strip()
-        return ""
-
-    # 1. Update Section and Block structural contexts if explicitly provided
-    current_section = get("section")
-    current_block = get("block")
+def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]]) -> List[SRDField]:
+    col_map = _build_col_map(headers)
+    fields: List[SRDField] = []
     
-    if current_section:
-        state_ctx["section"] = current_section
-    if current_block:
-        state_ctx["block"] = current_block
+    state_ctx = {"section": "", "block": ""}
+    
+    name_idx = col_map.get("name")
+    type_idx = col_map.get("type")
+    
+    if name_idx is None:
+        return []
 
-    # 2. Extract Field Name
-    name = get("name")
-    if not name:
-        return None
+    for cells in raw_rows:
+        # Step A: Safe evaluation of structural headers
+        sec_val = cells[col_map.get("section")].strip() if col_map.get("section") is not None else ""
+        blk_val = cells[col_map.get("block")].strip() if col_map.get("block") is not None else ""
+        
+        if sec_val: state_ctx["section"] = sec_val
+        if blk_val: state_ctx["block"] = blk_val
 
-    # Skip header-like rows and separator rows
-    if re.match(r'^[-:| ]+$', name):
-        return None
+        raw_name = cells[name_idx].strip()
+        raw_type = cells[type_idx].strip() if type_idx is not None else ""
 
-    # 3. Process options & layout metadata
-    options_raw = get("options")
-    options = _extract_options(options_raw)
+        # Step B: Guard against accidental list items matching names (e.g. "- Company")
+        is_new_field = bool(raw_name and not re.match(r'^[-•*\d]', raw_name))
 
-    # 4. Process validations & conditional rules
-    validation_raw = get("validation")
-    validation_rules = [v.strip() for v in re.split(r"[;\n]", validation_raw) if v.strip()] if validation_raw else []
+        if is_new_field:
+            def get_cell(key: str) -> str:
+                idx = col_map.get(key)
+                return cells[idx].strip() if (idx is not None and idx < len(cells)) else ""
 
-    required_val = _infer_required(get("required"))
-    if required_val is None and validation_raw:
-        required_val = _required_from_validation(validation_raw)
+            validation_raw = get_cell("validation")
+            validation_rules = [v.strip() for v in re.split(r"[;\n]", validation_raw) if v.strip()] if validation_raw else []
 
-    hide_raw = get("hide_expression")
-    hide_expr = _clean_display_rule(hide_raw)
+            required_val = _infer_required(get_cell("required"))
+            if required_val is None and validation_raw:
+                required_val = _required_from_validation(validation_raw)
 
-    return SRDField(
-        name=name,
-        label=get("label") or name,
-        field_type=_infer_type(get("type")),
-        required=required_val,
-        hide_expression=hide_expr,
-        validation_rules=validation_rules,
-        options=options,
-        notes=get("notes") or None,
-        section=state_ctx.get("section") or None,
-        block=state_ctx.get("block") or None,
-    )
+            widget_req_raw = get_cell("widget_req")
+            widget_req = None if (not widget_req_raw or widget_req_raw.lower() in ("n/a", "na", "-", "–")) else widget_req_raw
+
+            field_obj = SRDField(
+                name=raw_name,
+                label=get_cell("label") or raw_name,
+                field_type=_infer_type(raw_type),
+                required=required_val,
+                hide_expression=_clean_display_rule(get_cell("hide_expression")),
+                validation_rules=validation_rules,
+                options=_extract_options(get_cell("options")),
+                notes=get_cell("notes") or None,
+                widget_requirements=widget_req,
+                section=state_ctx.get("section") or None,
+                block=state_ctx.get("block") or None,
+            )
+            fields.append(field_obj)
+            
+        elif fields:
+            # Step C: Append multi-line cell text blocks straight down to active object
+            target_field = fields[-1]
+            
+            for key, idx in col_map.items():
+                if idx >= len(cells): continue
+                append_val = cells[idx].strip()
+                if not append_val or append_val.lower() in ("n/a", "na"): continue
+                
+                if key == "options":
+                    target_field.options.extend(_extract_options(append_val))
+                    target_field.options = list(dict.fromkeys(target_field.options))
+                elif key == "validation":
+                    new_rules = [v.strip() for v in re.split(r"[;\n]", append_val) if v.strip()]
+                    target_field.validation_rules.extend(new_rules)
+                elif key == "hide_expression":
+                    cleaned_expr = _clean_display_rule(append_val)
+                    if cleaned_expr:
+                        target_field.hide_expression = (target_field.hide_expression or "") + "\n" + cleaned_expr
+
+    return fields
 
 
 # ---------------------------------------------------------------------------
-# Notion page parser
+# Reconstructed Markdown Table Engine (Corrects Column Alignment Shifts)
+# ---------------------------------------------------------------------------
+
+def _parse_markdown_tables(content: str) -> List[Tuple[List[str], List[List[str]]]]:
+    """
+    Parses raw markdown text tables cleanly by gathering true structural block 
+    rows using cell indices first, avoiding data corruption caused by raw string splits.
+    """
+    tables = []
+    lines = content.splitlines()
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line.startswith("|"):
+            i += 1
+            continue
+
+        # Isolate the structured block boundary
+        raw_table_lines = []
+        while i < len(lines):
+            stripped = lines[i].strip()
+            if stripped.startswith("|"):
+                raw_table_lines.append(stripped)
+                i += 1
+            else:
+                break
+
+        if len(raw_table_lines) < 3:
+            continue
+
+        # Extract clean headers
+        headers = [c.strip() for c in raw_table_lines[0].split("|")[1:-1]]
+        data_rows: List[List[str]] = []
+
+        # Iterate past structural header boundaries
+        for row_line in raw_table_lines[2:]:
+            # Standard cell splitter
+            cells = [c.strip() for c in row_line.split("|")[1:-1]]
+            
+            if re.match(r'^[-:| ]+$', "".join(cells)):
+                continue
+                
+            # Keep array sizing synchronized across wide columns
+            while len(cells) < len(headers):
+                cells.append("")
+            cells = cells[:len(headers)]
+
+            # Check if this row is a clean continuation row
+            non_empty_indices = [idx for idx, cell in enumerate(cells) if cell]
+            
+            # If the row only contains bullet markers or hanging indentation text,
+            # we flag it as an operational block modification row
+            is_bullet_continuation = False
+            if len(non_empty_indices) == 1:
+                target_idx = non_empty_indices[0]
+                if cells[target_idx].startswith(("-", "*", "•", "1.", "2.", "3.", "4.", "5.")):
+                    is_bullet_continuation = True
+
+            if data_rows and is_bullet_continuation:
+                # Merge elements into preceding object cells
+                data_rows[-1][target_idx] += "\n" + cells[target_idx]
+            else:
+                if any(cells):
+                    data_rows.append(cells)
+
+        tables.append((headers, data_rows))
+    return tables
+
+
+async def parse_markdown(content: str) -> List[SRDField]:
+    fields: List[SRDField] = []
+    for headers, rows in _parse_markdown_tables(content):
+        col_map = _build_col_map(headers)
+        if "name" not in col_map:
+            continue
+        compiled_fields = _process_compiled_rows(headers, rows)
+        fields.extend(compiled_fields)
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Notion entries / Metadata API connectors
 # ---------------------------------------------------------------------------
 
 async def _parse_notion_table(notion: NotionClient, table_block: dict) -> List[SRDField]:
     has_header = table_block["table"].get("has_column_header", True)
     rows_resp = await notion.blocks.children.list(block_id=table_block["id"])
     rows = rows_resp["results"]
-    if not rows:
-        return []
+    if not rows: return []
 
     parsed_rows = [[_rich_text(cell) for cell in row["table_row"]["cells"]] for row in rows]
-
     if has_header and len(parsed_rows) > 1:
         headers = parsed_rows[0]
         data = parsed_rows[1:]
     else:
-        headers = []
-        data = parsed_rows
+        headers, data = [], parsed_rows
 
-    col_map = _build_col_map(headers)
-    fields = []
-    state_ctx = {"section": "", "block": ""}
-    
-    for row in data:
-        f = _row_to_field(row, col_map, state_ctx)
-        if f:
-            fields.append(f)
-    return fields
+    return _process_compiled_rows(headers, data)
 
 
 async def _blocks_to_fields(notion: NotionClient, blocks: list) -> List[SRDField]:
@@ -295,127 +385,28 @@ async def _parse_notion_page(page_id: str) -> List[SRDField]:
     return await _blocks_to_fields(notion, resp["results"])
 
 
-# ---------------------------------------------------------------------------
-# Markdown parser
-# ---------------------------------------------------------------------------
-
-def _parse_markdown_tables(content: str) -> List[Tuple[List[str], List[List[str]]]]:
-    """Extract (headers, rows) tuples from raw markdown table syntax, stitching continuous rows."""
-    tables = []
-    lines = content.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i].strip()
-        if line.startswith("|") and line.endswith("|"):
-            block: List[str] = []
-            while i < len(lines) and lines[i].strip().startswith("|"):
-                block.append(lines[i].strip())
-                i += 1
-            if len(block) < 3:
-                continue
-                
-            headers = [c.strip() for c in block[0].split("|")[1:-1]]
-            
-            data_rows: List[List[str]] = []
-            for row_line in block[2:]:  # skip separator row (index 1)
-                row = [c.strip() for c in row_line.split("|")[1:-1]]
-                
-                # Check if this row is a continuation row (e.g., hanging list value)
-                is_continuation = False
-                if len(data_rows) > 0:
-                    non_empty_indices = [idx for idx, cell in enumerate(row) if cell]
-                    # If only 1 column contains text, and it's a bullet point continuation
-                    if len(non_empty_indices) == 1 and row[non_empty_indices[0]].startswith(('*', '-', '•')):
-                        is_continuation = True
-                        target_col = non_empty_indices[0]
-                
-                if is_continuation and data_rows:
-                    # Append bullet criteria text up to the active target element
-                    data_rows[-1][target_col] += "\n" + row[target_col]
-                else:
-                    if any(row):
-                        data_rows.append(row)
-                        
-            tables.append((headers, data_rows))
-        else:
-            i += 1
-    return tables
-
-
 def extract_metadata(content: str) -> Dict[str, Any]:
-    """Extract pricing, workflow, SLA, and other metadata from markdown sections."""
     metadata: Dict[str, Any] = {}
-
-    # Service name
     m = re.search(r'##\s*Service Name\s*\n+\*\*Eng\*\*:\s*(.+)', content, re.IGNORECASE)
-    if m:
-        metadata["service_name"] = m.group(1).strip()
-
-    # SLA
+    if m: metadata["service_name"] = m.group(1).strip()
     m = re.search(r'SLA\s*[-–]\s*(\d+\s*\w+)', content, re.IGNORECASE)
-    if m:
-        metadata["sla"] = m.group(1).strip()
-
-    # Workflow
-    m = re.search(r'Specify the workflow[^:]*:\s*\*\*?([^\n*]+)\*\*?', content, re.IGNORECASE)
-    if not m:
-        m = re.search(r'Specify new workflow here\s+([^\n]+)', content, re.IGNORECASE)
-    if m:
-        metadata["workflow"] = m.group(1).strip()
-
-    # Pricing — is it free?
-    pricing_section = re.search(
-        r'#\s*Pricing(.+?)(?=\n#\s|\Z)', content, re.IGNORECASE | re.DOTALL
-    )
-    if pricing_section:
-        blob = pricing_section.group(1)
-        if re.search(r'not applicable because service is free', blob, re.IGNORECASE):
-            metadata["pricing"] = "free"
-        else:
-            # Try to extract fixed amounts
-            amounts = re.findall(r'(\d[\d,]*\s*RWF(?:\s*per\s*[^\n,]+)?)', blob, re.IGNORECASE)
-            metadata["pricing"] = amounts if amounts else "see document"
-
+    if m: metadata["sla"] = m.group(1).strip()
     return metadata
 
 
-async def parse_markdown(content: str) -> List[SRDField]:
-    fields: List[SRDField] = []
-    state_ctx = {"section": "", "block": ""}
-    
-    for headers, rows in _parse_markdown_tables(content):
-        col_map = _build_col_map(headers)
-        # Only process tables that look like form-field tables
-        if "name" not in col_map:
-            continue
-            
-        for row in rows:
-            f = _row_to_field(row, col_map, state_ctx)
-            if f:
-                fields.append(f)
-    return fields
-
-
 async def parse_srd_document(content: str) -> dict:
-    """Parse a full SRD markdown document and return fields + metadata."""
     fields = await parse_markdown(content)
     metadata = extract_metadata(content)
     return {
         "fields": [f.model_dump() for f in fields],
         "metadata": metadata,
-        "field_count": len(fields),
+        "field_count": len(fields)
     }
 
 
-# ---------------------------------------------------------------------------
-# Public entry points
-# ---------------------------------------------------------------------------
-
 async def parse_srd_url(url: str) -> List[SRDField]:
     if "notion.so" in url or "notion.com" in url:
-        page_id = _extract_notion_page_id(url)
-        return await _parse_notion_page(page_id)
-
+        return await _parse_notion_page(_extract_notion_page_id(url))
     async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
         resp = await client.get(url)
         resp.raise_for_status()

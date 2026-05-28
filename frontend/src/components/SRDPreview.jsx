@@ -42,8 +42,22 @@ function MetaCard({ label, value, color = 'text-slate-300' }) {
   );
 }
 
-export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoading }) {
-  const { fields = [], metadata = {}, source, field_count } = srdData;
+function TabButton({ label, active, onClick }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-4 py-2 text-sm font-semibold rounded-t-lg border-b-2 transition-colors ${
+        active
+          ? 'border-indigo-500 text-indigo-300 bg-slate-800'
+          : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-800/50'
+      }`}
+    >
+      {label}
+    </button>
+  );
+}
+
+function FieldsTab({ fields, field_count }) {
   const [search, setSearch] = useState('');
   const [sectionFilter, setSectionFilter] = useState('');
 
@@ -66,45 +80,8 @@ export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoadi
     });
   }, [fields, search, sectionFilter]);
 
-  const pricingLabel =
-    metadata.pricing === 'free'
-      ? 'Free'
-      : Array.isArray(metadata.pricing)
-      ? metadata.pricing.join(', ')
-      : metadata.pricing;
-
   return (
-    <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-xl overflow-hidden">
-      {/* Header */}
-      <div className="p-5 border-b border-slate-700 space-y-4">
-        <div className="flex items-start justify-between flex-wrap gap-3">
-          <div>
-            <h2 className="text-xl font-bold text-slate-100">
-              {metadata.service_name ?? 'SRD Extraction Preview'}
-            </h2>
-            <p className="text-xs text-slate-500 mt-1 font-mono truncate max-w-lg">{source}</p>
-          </div>
-          <span className="px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-700 text-sm font-bold">
-            {field_count} fields extracted
-          </span>
-        </div>
-
-        {/* Metadata cards */}
-        {(metadata.service_name || metadata.workflow || metadata.sla || metadata.pricing) && (
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <MetaCard label="Workflow" value={metadata.workflow} color="text-indigo-300" />
-            <MetaCard label="SLA" value={metadata.sla} color="text-amber-300" />
-            <MetaCard
-              label="Pricing"
-              value={pricingLabel}
-              color={metadata.pricing === 'free' ? 'text-emerald-400' : 'text-slate-300'}
-            />
-            <MetaCard label="Target" value={serviceUrl} color="text-cyan-300" />
-          </div>
-        )}
-      </div>
-
-      {/* Filters */}
+    <>
       <div className="flex flex-wrap gap-3 px-5 py-3 bg-slate-900/50 border-b border-slate-700">
         <input
           type="text"
@@ -128,7 +105,6 @@ export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoadi
         </span>
       </div>
 
-      {/* Fields table */}
       <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
         <table className="w-full text-left border-collapse text-sm">
           <thead className="sticky top-0 z-10">
@@ -139,6 +115,7 @@ export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoadi
               <th className="p-3 w-28">Type</th>
               <th className="p-3 w-24">Required</th>
               <th className="p-3 w-40">Options</th>
+              <th className="p-3 w-40">Widget Req.</th>
               <th className="p-3">Display Rule</th>
             </tr>
           </thead>
@@ -177,6 +154,13 @@ export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoadi
                   )}
                 </td>
                 <td className="p-3">
+                  {f.widget_requirements ? (
+                    <span className="text-xs text-cyan-400 font-mono">{f.widget_requirements}</span>
+                  ) : (
+                    <span className="text-slate-600 text-xs">—</span>
+                  )}
+                </td>
+                <td className="p-3">
                   {f.hide_expression ? (
                     <span className="text-xs text-amber-400 italic">{f.hide_expression}</span>
                   ) : (
@@ -187,14 +171,162 @@ export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoadi
             ))}
             {filtered.length === 0 && (
               <tr>
-                <td colSpan={7} className="p-8 text-center text-slate-500">No fields match your filter.</td>
+                <td colSpan={8} className="p-8 text-center text-slate-500">No fields match your filter.</td>
               </tr>
             )}
           </tbody>
         </table>
       </div>
+    </>
+  );
+}
 
-      {/* Footer — Run Full Audit */}
+function WorkflowTab({ metadata }) {
+  const { workflow, sla, status_labels } = metadata;
+  if (!workflow && !sla && !status_labels?.length) {
+    return (
+      <div className="p-8 text-center text-slate-500">No workflow information extracted.</div>
+    );
+  }
+  return (
+    <div className="p-6 space-y-6">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {workflow && (
+          <div className="bg-slate-900 rounded-lg p-4 border border-slate-700">
+            <div className="text-xs text-slate-500 uppercase tracking-wide mb-1">Workflow</div>
+            <div className="text-sm font-semibold text-indigo-300">{workflow}</div>
+          </div>
+        )}
+        {sla && (
+          <div className="bg-slate-900 rounded-lg p-4 border border-slate-700">
+            <div className="text-xs text-slate-500 uppercase tracking-wide mb-1">SLA</div>
+            <div className="text-sm font-semibold text-amber-300">{sla}</div>
+          </div>
+        )}
+      </div>
+
+      {status_labels?.length > 0 && (
+        <div>
+          <h3 className="text-sm font-semibold text-slate-300 mb-3">Status Labels</h3>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-sm">
+              <thead>
+                <tr className="bg-slate-900 border-b border-slate-700 text-slate-400 text-xs uppercase tracking-wide">
+                  <th className="p-3">Status</th>
+                  <th className="p-3">Label</th>
+                  <th className="p-3">Description</th>
+                </tr>
+              </thead>
+              <tbody>
+                {status_labels.map((row, i) => (
+                  <tr key={i} className="border-b border-slate-800 hover:bg-slate-700/30">
+                    <td className="p-3 text-slate-300 font-medium">{row.status || '—'}</td>
+                    <td className="p-3 text-indigo-300">{row.label || '—'}</td>
+                    <td className="p-3 text-slate-400 text-xs">{row.description || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PricingTab({ metadata }) {
+  const { pricing } = metadata;
+  if (!pricing) {
+    return (
+      <div className="p-8 text-center text-slate-500">No pricing information extracted.</div>
+    );
+  }
+
+  const isFree = pricing === 'free';
+  const amounts = Array.isArray(pricing) ? pricing : null;
+
+  return (
+    <div className="p-6 space-y-4">
+      <div className={`rounded-lg p-5 border ${isFree ? 'border-emerald-700 bg-emerald-900/20' : 'border-slate-700 bg-slate-900'}`}>
+        <div className="text-xs text-slate-500 uppercase tracking-wide mb-1">Pricing Model</div>
+        {isFree ? (
+          <div className="text-lg font-bold text-emerald-400">Free Service</div>
+        ) : amounts ? (
+          <ul className="space-y-2 mt-2">
+            {amounts.map((a, i) => (
+              <li key={i} className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-amber-400 inline-block" />
+                {a}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <div className="text-sm text-slate-400">{pricing}</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function SRDPreview({ srdData, serviceUrl, onRunAudit, auditLoading }) {
+  const { fields = [], metadata = {}, source, field_count } = srdData;
+  const [activeTab, setActiveTab] = useState('fields');
+
+  const pricingLabel =
+    metadata.pricing === 'free'
+      ? 'Free'
+      : Array.isArray(metadata.pricing)
+      ? metadata.pricing.join(', ')
+      : metadata.pricing;
+
+  const tabs = [
+    { id: 'fields', label: `Form Fields (${field_count})` },
+    { id: 'workflow', label: 'Workflow' },
+    { id: 'pricing', label: 'Pricing' },
+  ];
+
+  return (
+    <div className="bg-slate-800 rounded-xl border border-slate-700 shadow-xl overflow-hidden">
+      {/* Header */}
+      <div className="p-5 border-b border-slate-700 space-y-4">
+        <div className="flex items-start justify-between flex-wrap gap-3">
+          <div>
+            <h2 className="text-xl font-bold text-slate-100">
+              {metadata.service_name ?? 'SRD Extraction Preview'}
+            </h2>
+            <p className="text-xs text-slate-500 mt-1 font-mono truncate max-w-lg">{source}</p>
+          </div>
+          <span className="px-3 py-1 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-700 text-sm font-bold">
+            {field_count} fields extracted
+          </span>
+        </div>
+
+        {/* Quick-glance cards */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <MetaCard label="Workflow" value={metadata.workflow} color="text-indigo-300" />
+          <MetaCard label="SLA" value={metadata.sla} color="text-amber-300" />
+          <MetaCard
+            label="Pricing"
+            value={pricingLabel}
+            color={metadata.pricing === 'free' ? 'text-emerald-400' : 'text-slate-300'}
+          />
+          <MetaCard label="Target" value={serviceUrl} color="text-cyan-300" />
+        </div>
+      </div>
+
+      {/* Tab bar */}
+      <div className="flex gap-1 px-4 pt-2 border-b border-slate-700 bg-slate-900/30">
+        {tabs.map((t) => (
+          <TabButton key={t.id} label={t.label} active={activeTab === t.id} onClick={() => setActiveTab(t.id)} />
+        ))}
+      </div>
+
+      {/* Tab content */}
+      {activeTab === 'fields' && <FieldsTab fields={fields} field_count={field_count} />}
+      {activeTab === 'workflow' && <WorkflowTab metadata={metadata} />}
+      {activeTab === 'pricing' && <PricingTab metadata={metadata} />}
+
+      {/* Footer */}
       <div className="p-5 border-t border-slate-700 bg-slate-900/50 flex items-center justify-between flex-wrap gap-3">
         <p className="text-sm text-slate-400">
           Review the extracted fields above, then run the live form audit.

@@ -28,6 +28,7 @@ class SRDField(BaseModel):
     validation_rules: List[str] = []
     options: List[str] = []
     notes: Optional[str] = None
+    widget_requirements: Optional[str] = None
     section: Optional[str] = None
     block: Optional[str] = None
 
