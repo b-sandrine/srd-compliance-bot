@@ -124,18 +124,14 @@ def _extract_options(raw: str) -> List[str]:
         return []
 
     options: List[str] = []
-    # Strip common structural header noise inside the cells
-    clean_raw = re.sub(r'(placeholder|list of values|dropdown values|values?):', '', raw, flags=re.IGNORECASE).strip()
-    
+    clean_raw = re.sub(r'(placeholder|list of values|dropdown values|values?|select values?):', '', raw, flags=re.IGNORECASE).strip()
+
     for line in clean_raw.splitlines():
         stripped = line.strip()
-        # Clean off numbered lists (1. Text) or bullet arrays (- Text / * Text)
         m = re.match(r'^(?:\d+[\.\)]|[-•*])\s*(.*)', stripped)
-        if m:
-            item = m.group(1).strip()
-        else:
-            item = stripped
-            
+        if not m:
+            continue
+        item = m.group(1).strip()
         item = re.sub(r'\*\*([^*]+)\*\*', r'\1', item).strip()
         if item and item.lower() not in ("n/a", "na", ""):
             options.append(item)
@@ -186,11 +182,9 @@ def _build_col_map(headers: List[str]) -> dict:
 # Core Stateful Transformer Engine
 # ---------------------------------------------------------------------------
 
-def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]]) -> List[SRDField]:
+def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]], state_ctx: dict) -> List[SRDField]:
     col_map = _build_col_map(headers)
     fields: List[SRDField] = []
-    
-    state_ctx = {"section": "", "block": ""}
     
     name_idx = col_map.get("name")
     type_idx = col_map.get("type")
@@ -199,18 +193,21 @@ def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]]) -> Lis
         return []
 
     for cells in raw_rows:
-        # Step A: Safe evaluation of structural headers
-        sec_val = cells[col_map.get("section")].strip() if col_map.get("section") is not None else ""
-        blk_val = cells[col_map.get("block")].strip() if col_map.get("block") is not None else ""
+        # Check column index presence safely before cleaning spacing mutations
+        sec_idx = col_map.get("section")
+        blk_idx = col_map.get("block")
         
+        sec_val = cells[sec_idx].strip() if (sec_idx is not None and sec_idx < len(cells)) else ""
+        blk_val = cells[blk_idx].strip() if (blk_idx is not None and blk_idx < len(cells)) else ""
+        
+        # If the row defines a specific section/block, update our contextual trace
         if sec_val: state_ctx["section"] = sec_val
         if blk_val: state_ctx["block"] = blk_val
 
-        raw_name = cells[name_idx].strip()
-        raw_type = cells[type_idx].strip() if type_idx is not None else ""
+        raw_name = cells[name_idx].strip() if name_idx < len(cells) else ""
+        raw_type = cells[type_idx].strip() if (type_idx is not None and type_idx < len(cells)) else ""
 
-        # Step B: Guard against accidental list items matching names (e.g. "- Company")
-        is_new_field = bool(raw_name and not re.match(r'^[-•*\d]', raw_name))
+        is_new_field = bool(raw_name and not re.match(r'^[-•*\d]', raw_name) and raw_name.lower() != "field name")
 
         if is_new_field:
             def get_cell(key: str) -> str:
@@ -243,7 +240,6 @@ def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]]) -> Lis
             fields.append(field_obj)
             
         elif fields:
-            # Step C: Append multi-line cell text blocks straight down to active object
             target_field = fields[-1]
             
             for key, idx in col_map.items():
@@ -266,84 +262,102 @@ def _process_compiled_rows(headers: List[str], raw_rows: List[List[str]]) -> Lis
 
 
 # ---------------------------------------------------------------------------
-# Reconstructed Markdown Table Engine (Corrects Column Alignment Shifts)
+# Reconstructed Markdown Table Engine
 # ---------------------------------------------------------------------------
 
 def _parse_markdown_tables(content: str) -> List[Tuple[List[str], List[List[str]]]]:
-    """
-    Parses raw markdown text tables cleanly by gathering true structural block 
-    rows using cell indices first, avoiding data corruption caused by raw string splits.
+    """Parse markdown tables, correctly handling multi-line cells.
+
+    IremboGov SRDs have rows where the options column spans several source lines.
+    The row starts on a `|` line, option bullets continue on non-`|` lines, and
+    the last continuation line ends with `| widget | validation | ... |`.
+    Joining all parts and splitting by `|` reconstructs the full cell list.
     """
     tables = []
     lines = content.splitlines()
     i = 0
-    
+
     while i < len(lines):
         line = lines[i].strip()
         if not line.startswith("|"):
             i += 1
             continue
 
-        # Isolate the structured block boundary
-        raw_table_lines = []
+        # Collect logical rows: each "|"-line absorbs following non-"|" continuation lines.
+        logical_rows: List[str] = []
+
         while i < len(lines):
             stripped = lines[i].strip()
-            if stripped.startswith("|"):
-                raw_table_lines.append(stripped)
+            if not stripped:
                 i += 1
+                break
+            if stripped.startswith("|"):
+                row_parts = [stripped]
+                i += 1
+                # Absorb continuation lines (non-"|", non-empty)
+                while i < len(lines):
+                    cont = lines[i].strip()
+                    if cont.startswith("|") or not cont:
+                        break
+                    row_parts.append(cont)
+                    i += 1
+                logical_rows.append("\n".join(row_parts))
             else:
+                i += 1
                 break
 
-        if len(raw_table_lines) < 3:
+        if len(logical_rows) < 3:
             continue
 
-        # Extract clean headers
-        headers = [c.strip() for c in raw_table_lines[0].split("|")[1:-1]]
+        headers = [c.strip() for c in logical_rows[0].split("|")[1:-1]]
         data_rows: List[List[str]] = []
 
-        # Iterate past structural header boundaries
-        for row_line in raw_table_lines[2:]:
-            # Standard cell splitter
-            cells = [c.strip() for c in row_line.split("|")[1:-1]]
-            
+        for row_str in logical_rows[1:]:
+            # Split the full logical-row string by "|" — newlines inside a cell are preserved.
+            parts = row_str.split("|")
+            cells = [p.strip() for p in parts[1:-1]]
+
             if re.match(r'^[-:| ]+$', "".join(cells)):
                 continue
-                
-            # Keep array sizing synchronized across wide columns
+
             while len(cells) < len(headers):
                 cells.append("")
             cells = cells[:len(headers)]
 
-            # Check if this row is a clean continuation row
-            non_empty_indices = [idx for idx, cell in enumerate(cells) if cell]
-            
-            # If the row only contains bullet markers or hanging indentation text,
-            # we flag it as an operational block modification row
-            is_bullet_continuation = False
-            if len(non_empty_indices) == 1:
-                target_idx = non_empty_indices[0]
-                if cells[target_idx].startswith(("-", "*", "•", "1.", "2.", "3.", "4.", "5.")):
-                    is_bullet_continuation = True
+            if any(cells):
+                data_rows.append(cells)
 
-            if data_rows and is_bullet_continuation:
-                # Merge elements into preceding object cells
-                data_rows[-1][target_idx] += "\n" + cells[target_idx]
-            else:
-                if any(cells):
-                    data_rows.append(cells)
+        if data_rows:
+            tables.append((headers, data_rows))
 
-        tables.append((headers, data_rows))
     return tables
 
 
 async def parse_markdown(content: str) -> List[SRDField]:
     fields: List[SRDField] = []
+    state_ctx = {"section": "General", "block": "General"}
+
     for headers, rows in _parse_markdown_tables(content):
         col_map = _build_col_map(headers)
         if "name" not in col_map:
             continue
-        compiled_fields = _process_compiled_rows(headers, rows)
+
+        # Reject reference/lookup tables (Supported Field Types, Office Assignment, etc.).
+        # A form-fields table must have either:
+        #   (a) a section or block column, OR
+        #   (b) a type column that is distinct from the name column AND a validation column.
+        # "Supported Field Types" fails (b) because "Field Type Name" maps both "type" and
+        # "name" to the same column index.
+        has_section = "section" in col_map or "block" in col_map
+        type_idx = col_map.get("type")
+        name_idx = col_map.get("name")
+        has_distinct_type = type_idx is not None and type_idx != name_idx
+        if not has_section and not (has_distinct_type and "validation" in col_map):
+            continue
+
+        compiled_fields = _process_compiled_rows(headers, rows, state_ctx)
         fields.extend(compiled_fields)
+
     return fields
 
 
@@ -351,7 +365,7 @@ async def parse_markdown(content: str) -> List[SRDField]:
 # Notion entries / Metadata API connectors
 # ---------------------------------------------------------------------------
 
-async def _parse_notion_table(notion: NotionClient, table_block: dict) -> List[SRDField]:
+async def _parse_notion_table(notion: NotionClient, table_block: dict, state_ctx: dict) -> List[SRDField]:
     has_header = table_block["table"].get("has_column_header", True)
     rows_resp = await notion.blocks.children.list(block_id=table_block["id"])
     rows = rows_resp["results"]
@@ -364,25 +378,26 @@ async def _parse_notion_table(notion: NotionClient, table_block: dict) -> List[S
     else:
         headers, data = [], parsed_rows
 
-    return _process_compiled_rows(headers, data)
+    return _process_compiled_rows(headers, data, state_ctx)
 
 
-async def _blocks_to_fields(notion: NotionClient, blocks: list) -> List[SRDField]:
+async def _blocks_to_fields(notion: NotionClient, blocks: list, state_ctx: dict) -> List[SRDField]:
     fields: List[SRDField] = []
     for block in blocks:
         btype = block["type"]
         if btype == "table":
-            fields.extend(await _parse_notion_table(notion, block))
+            fields.extend(await _parse_notion_table(notion, block, state_ctx))
         elif btype in ("child_page", "child_database"):
             child_resp = await notion.blocks.children.list(block_id=block["id"])
-            fields.extend(await _blocks_to_fields(notion, child_resp["results"]))
+            fields.extend(await _blocks_to_fields(notion, child_resp["results"], state_ctx))
     return fields
 
 
 async def _parse_notion_page(page_id: str) -> List[SRDField]:
     notion = _get_notion_client()
     resp = await notion.blocks.children.list(block_id=page_id)
-    return await _blocks_to_fields(notion, resp["results"])
+    state_ctx = {"section": "General", "block": "General"}
+    return await _blocks_to_fields(notion, resp["results"], state_ctx)
 
 
 def extract_metadata(content: str) -> Dict[str, Any]:
